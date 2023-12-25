@@ -1,0 +1,9 @@
+data/CS
+data/CS_RAW
+__pycache__
+wandb
+log
+splits/cityscapes/gt_depths
+splits/cityscapes/gt_depths_cityscapes.zip
+sweep
+private
