@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 from dynamicdepth.rigid_warp import forward_warp
 import scipy
 
@@ -134,9 +134,7 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # DATA
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset,
-                         "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset}
+        datasets_dict = { "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset}
         self.dataset = datasets_dict[self.opt.dataset]
 
         if self.opt.split in ['cityscapes_preprocessed']:
