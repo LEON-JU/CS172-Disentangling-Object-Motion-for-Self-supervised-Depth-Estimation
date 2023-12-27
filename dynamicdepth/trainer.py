@@ -1059,9 +1059,9 @@ class Trainer:
                 wandb.log({"{}/consistency_mask/{}".format(mode, j): logimg}, step=self.step)
                 if mode == 'train':
                     consistency_target = colormap(outputs["consistency_target/0"][j])
-                    writer.add_image(
-                        "consistency_target/{}".format(j),
-                        consistency_target, self.step)
+                    # writer.add_image(
+                    #     "consistency_target/{}".format(j),
+                    #     consistency_target, self.step)
                     logimg = wandb.Image(consistency_target[0].transpose(1,2,0))
                     wandb.log({"{}/consistency_target/{}".format(mode, j): logimg}, step=self.step)
     def save_opts(self):
