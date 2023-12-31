@@ -49,14 +49,15 @@ class Trainer:
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
-        self.num_scales = len(self.opt.scales)
-        self.num_input_frames = len(self.opt.frame_ids)
+        self.num_scales = len(self.opt.scales) # len([0, 1, 2, 3])
+        self.num_input_frames = len(self.opt.frame_ids) # len([0, -1, 1])
         self.num_pose_frames = 2
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
 
         self.train_teacher_and_pose = not self.opt.freeze_teacher_and_pose
+        # self.train_teacher_and_pose == true
         if self.train_teacher_and_pose:
             print('using adaptive depth binning!')
             self.min_depth_tracker = 0.1
@@ -65,15 +66,15 @@ class Trainer:
             print('fixing pose network and monocular network!')
 
         # check the frames we need the dataloader to load
-        frames_to_load = self.opt.frame_ids.copy()
+        frames_to_load = self.opt.frame_ids.copy() # [0, -1, 1]
         self.matching_ids = [0]
         if self.opt.use_future_frame == 'true':
             self.matching_ids.append(1)
-        for idx in range(-1, -1 - self.opt.num_matching_frames, -1):
+        for idx in range(-1, -1 - self.opt.num_matching_frames, -1): # It run only once
             self.matching_ids.append(idx)
             if idx not in frames_to_load:
                 frames_to_load.append(idx)
-
+        # Now self.matching_ids = [0, -1]
         print('Loading frames: {}'.format(frames_to_load))
 
         # MODEL SETUP
