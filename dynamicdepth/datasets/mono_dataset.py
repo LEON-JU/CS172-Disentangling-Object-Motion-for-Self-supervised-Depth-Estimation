@@ -44,7 +44,7 @@ class MonoDataset(data.Dataset):
         self.width = width
         self.num_scales = num_scales
 
-        self.interp = Image.LANCZOS
+        self.interp = Image.BILINEAR
 
         self.frame_idxs = frame_idxs
 

@@ -277,7 +277,7 @@ class Trainer:
         """Run a single epoch of training and validation
         """
 
-        print("Training")
+        print("----------Training----------")
         self.set_train()
 
         for batch_idx, inputs in enumerate(self.train_loader):
@@ -376,15 +376,15 @@ class Trainer:
         ############# warpping image based on teacher model predicted pose and depth ###############
         if (not self.opt.no_warp) and self.opt.dataset in ['cityscapes_preprocessed', 'kitti']:
             with torch.no_grad():
-                _, teacher_depth = disp_to_depth(mono_outputs["disp", 0].detach().clone(), self.opt.min_depth, self.opt.max_depth)  # [12, 1, 192, 512]
+                _, teacher_depth = disp_to_depth(mono_outputs["disp", 0].detach().clone(), self.opt.min_depth, self.opt.max_depth) 
                 teacher_depth =teacher_depth.detach().clone()
-                tgt_imgs = inputs["color", 0, 0].detach().clone()  # [12, 3, 192, 512]
-                m1_pose = outputs[("cam_T_cam", 0, -1)][:, :3, :].detach().clone()  # [12, 3, 4]
-                intrins = inputs[('K', 0)][:,:3,:3]  # [12, 3, 3]
-                doj_mask = inputs["doj_mask"]  # [12, 1, 192, 512]
+                tgt_imgs = inputs["color", 0, 0].detach().clone()  # [B, 3, 192, 512]
+                m1_pose = outputs[("cam_T_cam", 0, -1)][:, :3, :].detach().clone()  # [B, 3, 4]
+                intrins = inputs[('K', 0)][:,:3,:3]  # [B, 3, 3]
+                doj_mask = inputs["doj_mask"]  # [B, 1, 192, 512]
                 tgt_imgs[doj_mask.repeat(1,3,1,1)==0] = 0
                 img_w_m1, _, _ = forward_warp(tgt_imgs, teacher_depth, m1_pose, intrins, upscale=3, rotation_mode='euler', padding_mode='zeros')
-                doj_maskm1 = inputs["doj_mask-1"].repeat(1,3,1,1)  # [12, 3, 192, 512]
+                doj_maskm1 = inputs["doj_mask-1"].repeat(1,3,1,1)  # [B, 3, 192, 512]
                 if self.opt.no_teacher_warp:
                     inputs['ori_color', -1, 0] = inputs["color", -1, 0].detach().clone()
                 inputs["color", -1, 0][doj_maskm1==1] = 0
@@ -394,9 +394,9 @@ class Trainer:
                     inputs["color", -1, 0][img_w_m1>0] = 0
                 inputs["color", -1, 0] = inputs["color", -1, 0].detach().clone()
 
-                non_cv_aug = [augmentation_mask[:,0,0,0]==0][0]  # [12]
+                non_cv_aug = [augmentation_mask[:,0,0,0]==0][0]  # [B]
                 if non_cv_aug.sum() > 0:
-                    tgt_imgs_aug = inputs["color_aug", 0, 0].detach().clone()  # [12, 3, 192, 512]
+                    tgt_imgs_aug = inputs["color_aug", 0, 0].detach().clone()  # [B, 3, 192, 512]
                     tgt_imgs_aug[doj_mask.repeat(1,3,1,1)==0] = 0
                     imgaug_w_m1, _, _ = forward_warp(tgt_imgs_aug[non_cv_aug], teacher_depth[non_cv_aug], m1_pose[non_cv_aug], intrins[non_cv_aug], upscale=3, rotation_mode='euler', padding_mode='zeros')
                     warp_frame = lookup_frames[non_cv_aug][:,0,:,:,:].detach().clone()
@@ -405,9 +405,9 @@ class Trainer:
                     lookup_frames[non_cv_aug] = warp_frame.unsqueeze(1).detach().clone()
 
                 if is_train:
-                    p1_pose = outputs[("cam_T_cam", 0, 1)][:, :3, :].detach().clone()  # [12, 3, 4]
+                    p1_pose = outputs[("cam_T_cam", 0, 1)][:, :3, :].detach().clone()  # [B, 3, 4]
                     img_w_p1, _, _ = forward_warp(tgt_imgs, teacher_depth, p1_pose, intrins, upscale=3, rotation_mode='euler', padding_mode='zeros')
-                    doj_maskp1 = inputs["doj_mask+1"].repeat(1,3,1,1)  # [12, 3, 192, 512]
+                    doj_maskp1 = inputs["doj_mask+1"].repeat(1,3,1,1)  # [B, 3, 192, 512]
                     if self.opt.no_teacher_warp:
                         inputs['ori_color', 1, 0] = inputs["color", -1, 0].detach().clone()
                     inputs["color", 1, 0][doj_maskp1==1] = 0
@@ -486,10 +486,6 @@ class Trainer:
             losses = self.compute_losses(inputs, outputs, is_multi=True)
 
             # update losses with single frame losses
-            #print('mono reproj loss: ', mono_losses['reproj_loss/0'])
-            #print('multi reproj loss: ', losses['reproj_loss/0'])
-            #print('multi consis loss: ', losses['consistency_loss/0'])
-            #print('')
             if self.train_teacher_and_pose:
                 for key, val in mono_losses.items():
                     if not self.opt.no_multi_loss:
