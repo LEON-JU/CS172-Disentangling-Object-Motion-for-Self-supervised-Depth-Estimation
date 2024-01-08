@@ -1,7 +1,7 @@
 import torch
 import random
 import numpy as np
-from .trainer import Trainer
+from .ds_depth import Trainer
 from .options import MonodepthOptions
 
 def seed_all(seed):

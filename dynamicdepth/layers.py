@@ -313,3 +313,93 @@ class grad_computation_tools(nn.Module):
         semantics_grad_bin = semantics_grad > self.semanticsTh
 
         return semantics_grad_bin
+
+def meshgrid(height, width, is_homogeneous=True):
+    x = torch.ones(height).float().view(height, 1)
+    # shape : (h,w)
+    x = torch.matmul(x, torch.linspace(0, 1, width).view(1, width))
+
+    y = torch.linspace(0, 1, height).view(height, 1)
+    # shape : (h,w)
+    y = torch.matmul(y, torch.ones(width).float().view(1, width))
+
+    x = x * (width - 1)
+    y = y * (height - 1)
+
+    if is_homogeneous:
+        ones = torch.ones(height, width).float()
+        coords = torch.stack((x, y, ones), dim=2)  # shape: h,w,3
+    else:
+        coords = torch.stack((x, y), dim=2)  # shape: h,w,2
+
+    # shape:  (h, w, 2 or 3)
+    return coords
+
+
+def flow_to_tgt_coords(src2tgt_flow):
+    # shape: (#batch,2,h,w)
+    batch_size, _, h, w = src2tgt_flow.shape
+
+    # shape: (#batch,h,w,2)
+    src2tgt_flow = src2tgt_flow.clone().permute(0, 2, 3, 1)
+
+    # shape: (#batch,h,w,2)
+    src_coords = meshgrid(h, w, False).repeat(batch_size, 1, 1, 1).cuda()
+
+    tgt_coords = src_coords + src2tgt_flow
+
+    normalizer = torch.tensor([(2. / w), (2. / h)]).repeat(batch_size, h, w, 1).float().cuda()
+    # shape: (#batch,h,w,2)
+    tgt_coords = tgt_coords * normalizer - 1
+
+    # shape: (#batch,h,w,2)
+    return tgt_coords
+
+
+def flow_warp(src_img, src2tgt_flow):
+    tgt_coords = flow_to_tgt_coords(src2tgt_flow)
+    tgt_img = F.grid_sample(src_img, tgt_coords, padding_mode="border", align_corners=True)
+    return tgt_img
+
+
+def image_similarity(x, y, alpha=0.85):
+    DSSIM = SSIM()
+    return alpha * DSSIM(x,y) + (1-alpha) * torch.abs(x-y)
+
+def L2_norm(x, dim, keep_dims=True):
+    curr_offset = 1e-10
+    l2_norm = torch.norm(torch.abs(x) + curr_offset,
+                         dim=dim, keepdim=keep_dims)
+    return l2_norm
+
+def bilinear_sampler(img, coords, mode='bilinear', mask=False):
+    """ Wrapper for grid_sample, uses pixel coordinates """
+    H, W = img.shape[-2:]
+    xgrid, ygrid = coords.split([1,1], dim=-1)
+    xgrid = 2*xgrid/(W-1) - 1
+    ygrid = 2*ygrid/(H-1) - 1
+
+    grid = torch.cat([xgrid, ygrid], dim=-1)
+    img = F.grid_sample(img, grid, align_corners=True)
+
+    if mask:
+        mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)
+        return img, mask.float()
+
+    return img
+
+
+def coords_grid(batch, ht, wd, device):
+    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device))
+    coords = torch.stack(coords[::-1], dim=0).float()
+    return coords[None].repeat(batch, 1, 1, 1)
+
+
+def gradient(D):
+    D_dy = D[:, :, 1:] - D[:, :, :-1]
+    D_dx = D[:, :, :, 1:] - D[:, :, :, :-1]
+    return D_dx, D_dy
+
+def flow_smooth_loss(flow):
+    dx, dy = gradient(flow)
+    return dx.abs().mean() + dy.abs().mean()
