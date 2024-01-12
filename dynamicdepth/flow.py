@@ -193,7 +193,7 @@ class Trainer:
 
         if self.opt.split in ['cityscapes_preprocessed']:
             print('loading cityscapes gt depths individually due to their combined size!')
-            self.gt_depths = 'splits/cityscapes/gt_depths'
+            self.gt_depths = '/public/home/CS172/xiaojx-cs172/cv1/dynamicdepth/splits/cityscapes/gt_depths'
         else:
             gt_path = os.path.join('splits', self.opt.eval_split, "gt_depths.npz")
             self.gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
