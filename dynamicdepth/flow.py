@@ -123,11 +123,10 @@ class Trainer:
                                  num_frames_to_predict_for=2)
         self.models["pose"].to(self.device)
 
-        self.models["flow"] = networks.FlowNet(6, 0.1)
-        self.models["flow"].to(self.device)
-        self.parameters_to_train += list(self.models["flow"].parameters())
-
-
+        if self.opt.use_flow:
+            self.models["flow"] = networks.FlowNet(6, 0.1)
+            self.models["flow"].to(self.device)
+            self.parameters_to_train += list(self.models["flow"].parameters())
 
         if self.train_teacher_and_pose:
             self.parameters_to_train += list(self.models["pose_encoder"].parameters())
@@ -302,7 +301,7 @@ class Trainer:
         self.set_train()
 
         for batch_idx, inputs in enumerate(self.train_loader):
-
+            print(f"current batch:{batch_idx}/{len(self.train_loader)}")
             before_op_time = time.time()
 
             outputs, losses = self.process_batch(inputs, is_train=True)
@@ -735,19 +734,20 @@ class Trainer:
                 #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
                 # print(frame_id)
          
-                if(frame_id == -1):
-                    flownet_input = torch.cat((inputs["color_aug", 0, 0],
-                                            inputs["color_aug", -1, 0]),dim=1)
-                    resflow,t2,t3,t4 = self.models["flow"](flownet_input)
-                else:
-                    flownet_input = torch.cat((inputs["color_aug", 0, 0],
-                                            inputs["color_aug", 1, 0]),dim=1)
-                    resflow,_,_,_ = self.models["flow"](flownet_input)
+                if self.opt.use_flow:
+                    if(frame_id == -1):
+                        flownet_input = torch.cat((inputs["color_aug", 0, 0],
+                                                inputs["color_aug", -1, 0]),dim=1)
+                        resflow,t2,t3,t4 = self.models["flow"](flownet_input)
+                    else:
+                        flownet_input = torch.cat((inputs["color_aug", 0, 0],
+                                                inputs["color_aug", 1, 0]),dim=1)
+                        resflow,_,_,_ = self.models["flow"](flownet_input)
 
-                
-                # print(cam_points.shape)
-                # raise RuntimeError(resflow.shape)
-                cam_points[:,:3,:] = cam_points[:,:3,:] + resflow.view(self.opt.batch_size, 3 , -1) * 0.1
+                    
+                    # print(cam_points.shape)
+                    # raise RuntimeError(resflow.shape)
+                    cam_points[:,:3,:] = cam_points[:,:3,:] + resflow.view(self.opt.batch_size, 3 , -1) * 0.1
                 #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
                 # raise RuntimeError(inputs.keys())
                 

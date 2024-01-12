@@ -10,4 +10,5 @@ python -m pip install cityscapesscripts
 pip install tensorboardX
 conda install pytorch-sparse -c pyg
 pip install chardet # https://blog.csdn.net/weixin_47037450/article/details/129616415
+pip install kornia==0.6.5
 ```

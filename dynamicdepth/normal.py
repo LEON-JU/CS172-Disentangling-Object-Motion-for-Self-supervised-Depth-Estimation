@@ -273,8 +273,8 @@ class Trainer:
 		"""
 		self.epoch = 0
 		self.step = 0
-		if self.opt.load_weights_folder is not None:
-			self.val()
+		# if self.opt.load_weights_folder is not None:
+		# 	self.val()
 		self.start_time = time.time()
 		for self.epoch in range(self.opt.num_epochs):
 			if self.epoch == self.opt.freeze_teacher_epoch:
@@ -911,7 +911,7 @@ class Trainer:
 		normal_ranking_weight = 0.1 # weight for normal ranking loss
 		normal_ranking_loss *= normal_ranking_weight
 		losses['normal_ranking_loss/{}'.format(scale)] = normal_ranking_loss
-		print("normal ranking loss: ", normal_ranking_loss)
+		# print("normal ranking loss: ", normal_ranking_loss)
 
 		total_loss += normal_ranking_loss
 		# ----------------------------------------------------------------------------

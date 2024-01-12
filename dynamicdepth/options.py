@@ -92,7 +92,7 @@ class MonodepthOptions:
         self.parser.add_argument("--batch_size",
                                  type=int,
                                  help="batch size",
-                                 default=2)
+                                 default=8)
         self.parser.add_argument("--learning_rate",
                                  type=float,
                                  help="learning rate",
@@ -201,6 +201,9 @@ class MonodepthOptions:
                                  type=str,
                                  help="models to load",
                                  default=["encoder", "depth", "pose_encoder", "pose"])
+        self.parser.add_argument("--use_flow",
+                                 help="if set, we will add flow net",
+                                 action="store_true")
 
         # LOGGING options
         self.parser.add_argument("--log_frequency",
