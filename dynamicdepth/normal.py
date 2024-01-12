@@ -1,6 +1,5 @@
 from mimetypes import init
 import os
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
@@ -23,7 +22,7 @@ from dynamicdepth.rigid_warp import forward_warp
 # --------------------------SC-depthv3 modules--------------------------------
 from kornia.geometry.depth import depth_to_normals
 from .normal_ranking_loss import EdgeguidedNormalRankingLoss
-# from kornia.geometry.depth import depth_to_3d
+from kornia.geometry.depth import depth_to_3d
 # ----------------------------------------------------------------------------
 import scipy
 
@@ -866,6 +865,7 @@ class Trainer:
 
 			
 			# --------------------------SC-depthv3 modules--------------------------------
+
 			# normal_matching loss:
 			# exploit normal information to guide the matching
 			if is_multi:
@@ -873,12 +873,11 @@ class Trainer:
 				# no gradients for mono prediction!
 				mono_depth = outputs[("mono_depth", 0, scale)].detach()
 
-				tgt_normal = depth_to_normals(multi_depth, inputs[("K", scale)][:,:3,:3])
-				tgt_pseudo_normal = depth_to_normals(mono_depth, inputs[("K", scale)][:,:3,:3])
+				tgt_normal = depth_to_normals(mono_depth, inputs[("K", scale)][:,:3,:3])
+				tgt_pseudo_normal = depth_to_normals(multi_depth, inputs[("K", scale)][:,:3,:3])
 
 				normal_l1_loss = (tgt_normal-tgt_pseudo_normal).abs().mean()
-				normal_l1_weight = 1 # weight for normal l1 loss
-				normal_l1_loss *= normal_l1_weight
+				normal_l1_loss *= 0.1 # weight from SC-depthv3
 
 				losses['normal_l1_loss/{}'.format(scale)] = normal_l1_loss
 			else:
@@ -897,6 +896,7 @@ class Trainer:
 			total_loss += loss
 			losses["loss/{}".format(scale)] = loss
 
+
 		# --------------------------SC-depthv3 modules--------------------------------
 		# normal_ranking loss:
 		scale = 0
@@ -908,7 +908,7 @@ class Trainer:
 		tgt_pseudo_normal = depth_to_normals(mono_depth, inputs[("K", scale)][:,:3,:3])
 
 		normal_ranking_loss = self.calculate_normal_ranking_loss(mono_depth, inputs[('color', 0, scale)], tgt_normal, tgt_pseudo_normal)
-		normal_ranking_weight = 1 # weight for normal ranking loss
+		normal_ranking_weight = 0.1 # weight for normal ranking loss
 		normal_ranking_loss *= normal_ranking_weight
 		losses['normal_ranking_loss/{}'.format(scale)] = normal_ranking_loss
 		print("normal ranking loss: ", normal_ranking_loss)

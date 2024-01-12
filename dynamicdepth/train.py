@@ -1,7 +1,8 @@
 import torch
 import random
 import numpy as np
-from .ds_depth import Trainer
+# from .normal import Trainer
+from .flow import Trainer
 from .options import MonodepthOptions
 
 def seed_all(seed):
@@ -15,7 +16,7 @@ def seed_all(seed):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.enabled = False
     torch.backends.cudnn.benchmark = False
 
 options = MonodepthOptions()
@@ -24,5 +25,6 @@ opts = options.parse()
 seed_all(opts.pytorch_random_seed)
 
 if __name__ == "__main__":
+    torch.cuda.empty_cache()
     trainer = Trainer(opts)
     trainer.train()

@@ -36,7 +36,8 @@ def conv(in_chnls, out_chnls):
 
 
 def get_flow(in_chnls):
-    return nn.Conv2d(in_chnls, 2, kernel_size=1, padding=0)
+    # return nn.Conv2d(in_chnls, 2, kernel_size=1, padding=0)
+    return nn.Conv2d(in_chnls, 3, kernel_size=1, padding=0)
 
 
 class FlowNet(nn.Module):
@@ -65,9 +66,9 @@ class FlowNet(nn.Module):
         self.iconv6 = conv(512 + 512, 512)
         self.iconv5 = conv(256 + 256, 256)
         self.iconv4 = conv(128 + 128, 128)
-        self.iconv3 = conv(64 + 64 + 2, 64)  # 64+64+2 in 1/4 out 1/4, 64+64+2
-        self.iconv2 = conv(32 + 32 + 2, 32)  # 32+32+2 in 1/2 out 1/2, 32+32+2
-        self.iconv1 = conv(16 + 2, 16)  # 16+2 in 1/1 out 1/1, 16+2
+        self.iconv3 = conv(64 + 64 + 3, 64)  # 64+64+2 in 1/4 out 1/4, 64+64+2
+        self.iconv2 = conv(32 + 32 + 3, 32)  # 32+32+2 in 1/2 out 1/2, 32+32+2
+        self.iconv1 = conv(16 + 3, 16)  # 16+2 in 1/1 out 1/1, 16+2
 
         self.flow4 = get_flow(128)
         self.flow3 = get_flow(64)

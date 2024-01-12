@@ -1,53 +1,46 @@
-# Copyright Niantic 2021. Patent Pending. All rights reserved.
-#
-# This software is licensed under the terms of the ManyDepth licence
-# which allows for non-commercial use only, the full terms of which are made
-# available in the LICENSE file.
-
+from mimetypes import init
 import os
-
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
-
+os.environ["WANDB_MODE"] = "offline"
+import pdb
 import numpy as np
 import time
 import random
-import flow_vis
 from tqdm import tqdm
-
+import wandb
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
+from dynamicdepth.rigid_warp import forward_warp
+
 import scipy
+
 import json
 
-from .utils import readlines
+from .utils import readlines, sec_to_hm_str
 from .layers import SSIM, BackprojectDepth, Project3D, transformation_from_parameters, \
-    disp_to_depth, get_smooth_loss, flow_warp, image_similarity, L2_norm, flow_smooth_loss, \
-    compute_depth_errors
+    disp_to_depth, get_smooth_loss, compute_depth_errors
 
 from dynamicdepth import datasets, networks
+from .networks.flownet import FlowNet
 import matplotlib.pyplot as plt
-import dynamicdepth.rigid_warp as tool
-from dynamicdepth.rigid_warp import forward_warp
 
 
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
-
 def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2 ** 32
+    worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
 
 class Trainer:
     def __init__(self, options):
         self.opt = options
-
+        wandb.init(project='DynamicDepth')
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
         # checking height and width are multiples of 32
@@ -62,7 +55,6 @@ class Trainer:
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
         self.num_pose_frames = 2
-        self.warp_depths = None
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
@@ -85,6 +77,11 @@ class Trainer:
             if idx not in frames_to_load:
                 frames_to_load.append(idx)
 
+        # self.mat_I = torch.eye(4)
+        # self.mat_I = self.mat_I.unsqueeze(0)
+        # self.mat_I = self.mat_I.expand(self.opt.batch_size,-1,-1).cuda()
+        # raise RuntimeError(self.mat_I.shape)
+
         print('Loading frames: {}'.format(frames_to_load))
 
         # MODEL SETUP
@@ -99,8 +96,9 @@ class Trainer:
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["depth"].to(self.device)
 
-        self.parameters_to_train += list(self.models["encoder"].parameters())
-        self.parameters_to_train += list(self.models["depth"].parameters())
+        if not self.opt.train_teacher_only:
+            self.parameters_to_train += list(self.models["encoder"].parameters())
+            self.parameters_to_train += list(self.models["depth"].parameters())
 
         self.models["mono_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained")
@@ -125,13 +123,18 @@ class Trainer:
                                  num_frames_to_predict_for=2)
         self.models["pose"].to(self.device)
 
-        self.models["flow"] = networks.FlowNet(12, 0.1)
+        self.models["flow"] = networks.FlowNet(6, 0.1)
         self.models["flow"].to(self.device)
         self.parameters_to_train += list(self.models["flow"].parameters())
+
+
 
         if self.train_teacher_and_pose:
             self.parameters_to_train += list(self.models["pose_encoder"].parameters())
             self.parameters_to_train += list(self.models["pose"].parameters())
+
+        # m_device_ids = [0, 1]
+        # self.models = torch.nn.DataParallel(self.models, device_ids=m_device_ids)
 
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
@@ -164,7 +167,9 @@ class Trainer:
 
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
-            frames_to_load, 4, is_train=True, img_ext=img_ext)
+            frames_to_load, 4, is_train=not self.opt.export, img_ext=img_ext)
+        if self.opt.export:
+            self.opt.batch_size = 1
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, shuffle=False,#not self.opt.export,
             num_workers=self.opt.num_workers, pin_memory=False, drop_last=True,
@@ -189,7 +194,7 @@ class Trainer:
 
         if self.opt.split in ['cityscapes_preprocessed']:
             print('loading cityscapes gt depths individually due to their combined size!')
-            self.gt_depths = 'splits/cityscapes/gt_depths/'
+            self.gt_depths = 'splits/cityscapes/gt_depths'
         else:
             gt_path = os.path.join('splits', self.opt.eval_split, "gt_depths.npz")
             self.gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
@@ -223,11 +228,16 @@ class Trainer:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
+        wandb.config.update(self.opt)
+        self.best = 10.0
+        self.doj_best = 10.0
+        #torch.autograd.set_detect_anomaly(True)
 
     def set_train(self):
         """Convert all models to training mode
         """
         for k, m in self.models.items():
+            # print(k)
             if self.train_teacher_and_pose:
                 m.train()
             else:
@@ -235,6 +245,28 @@ class Trainer:
                 # multi components
                 if k in ['depth', 'encoder']:
                     m.train()
+        # raise RuntimeError("?")
+        
+
+    def freeze_teacher(self):
+        if self.train_teacher_and_pose:
+            assert not self.opt.train_teacher_only
+            self.train_teacher_and_pose = False
+            print('freezing teacher and pose networks!')
+
+            # here we reinitialise our optimizer to ensure there are no updates to the
+            # teacher and pose networks
+            self.parameters_to_train = []
+            self.parameters_to_train += list(self.models["encoder"].parameters())
+            self.parameters_to_train += list(self.models["depth"].parameters())
+            self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
+            self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+                self.model_optimizer, self.opt.scheduler_step_size, 0.1)
+
+            # set eval so that teacher + pose batch norm is running average
+            self.set_eval()
+            # set train so that multi batch norm is in train mode
+            self.set_train()
 
     def set_eval(self):
         """Convert all models to testing/evaluation mode
@@ -247,75 +279,60 @@ class Trainer:
         """
         self.epoch = 0
         self.step = 0
-        if self.opt.load_weights_folder is not None:
-            self.val()
+        # if self.opt.load_weights_folder is not None:
+        #     self.val()
         self.start_time = time.time()
         for self.epoch in range(self.opt.num_epochs):
+
             if self.epoch == self.opt.freeze_teacher_epoch:
                 self.freeze_teacher()
 
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-
-    def freeze_teacher(self):
-        if self.train_teacher_and_pose:
-            self.train_teacher_and_pose = False
-            print('freezing teacher and pose networks!')
-
-            # here we reinitialise our optimizer to ensure there are no updates to the
-            # teacher and pose networks
-            for p in self.models["mono_encoder"].parameters():
-                p.requires_grad = False
-            for p in self.models["mono_depth"].parameters():
-                p.requires_grad = False
-            for p in self.models["pose_encoder"].parameters():
-                p.requires_grad = False
-            for p in self.models["pose"].parameters():
-                p.requires_grad = False
-            for p in self.models["flow"].parameters():
-                p.requires_grad = False
-            self.set_eval()
-            self.set_train()
-
+        self.models = init
+        wandb.join()
 
     def run_epoch(self):
         """Run a single epoch of training and validation
         """
 
-        print("----------Training----------")
+        print("Training")
+        # print("here")
         self.set_train()
 
-        loop = tqdm(enumerate(self.train_loader), total=len(self.train_loader), ncols=100)
-        for batch_idx, inputs in loop:
+        for batch_idx, inputs in enumerate(self.train_loader):
+
+            before_op_time = time.time()
 
             outputs, losses = self.process_batch(inputs, is_train=True)
-            self.model_optimizer.zero_grad()
-            losses["loss"].backward()
-            self.model_optimizer.step()
+            if not self.opt.export:
+                self.model_optimizer.zero_grad()
+                losses["loss"].backward()
+                self.model_optimizer.step()
 
-            loop.set_description(f'Epoch [{self.epoch + 1}/{self.opt.num_epochs}]')
-            loop.set_postfix(loss='{:.6f}'.format(losses["loss"].item()))
+            duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
             early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 4000
             late_phase = self.step % 2000 == 0
 
-            if late_phase % 100 == 0:
-                self.log_loss("train", losses)
+            if (early_phase or late_phase) and self.step > 0 and not self.opt.export:
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
 
-            if early_phase or late_phase:
+                if "depth_gt" in inputs:
+                    self.compute_depth_losses(inputs, outputs, losses)
 
                 self.log("train", inputs, outputs, losses)
                 self.val()
-
-            if self.opt.save_intermediate_models:
-                if self.step % 2000 == 0:
+                if self.opt.save_intermediate_models and late_phase:
                     self.save_model(save_step=True)
-
-            if self.step == self.opt.freeze_teacher_step:
-                self.freeze_teacher()
-
+                if self.step == self.opt.freeze_teacher_step:
+                    self.freeze_teacher()
+            
+            if self.opt.export and self.step==0:
+                self.val()
+                    
             self.step += 1
         self.model_lr_scheduler.step()
 
@@ -330,10 +347,10 @@ class Trainer:
 
         # predict poses for all frames
         if self.train_teacher_and_pose:
-            pose_pred = self.predict_poses(inputs, None)
+            pose_pred = self.predict_poses(inputs, None, is_train or self.opt.export)
         else:
             with torch.no_grad():
-                pose_pred = self.predict_poses(inputs, None)
+                pose_pred = self.predict_poses(inputs, None, is_train or self.opt.export)
         outputs.update(pose_pred)
         mono_outputs.update(pose_pred)
 
@@ -376,18 +393,19 @@ class Trainer:
                 feats = self.models["mono_encoder"](inputs["color_aug", 0, 0])
                 mono_outputs.update(self.models['mono_depth'](feats))
 
+
         ############# warpping image based on teacher model predicted pose and depth ###############
         if (not self.opt.no_warp) and self.opt.dataset in ['cityscapes_preprocessed', 'kitti']:
             with torch.no_grad():
-                _, teacher_depth = disp_to_depth(mono_outputs["disp", 0].detach().clone(), self.opt.min_depth, self.opt.max_depth) 
+                _, teacher_depth = disp_to_depth(mono_outputs["disp", 0].detach().clone(), self.opt.min_depth, self.opt.max_depth)  # [12, 1, 192, 512]
                 teacher_depth =teacher_depth.detach().clone()
-                tgt_imgs = inputs["color", 0, 0].detach().clone()  # [B, 3, 192, 512]
-                m1_pose = outputs[("cam_T_cam", 0, -1)][:, :3, :].detach().clone()  # [B, 3, 4]
-                intrins = inputs[('K', 0)][:,:3,:3]  # [B, 3, 3]
-                doj_mask = inputs["doj_mask"]  # [B, 1, 192, 512]
+                tgt_imgs = inputs["color", 0, 0].detach().clone()  # [12, 3, 192, 512]
+                m1_pose = outputs[("cam_T_cam", 0, -1)][:, :3, :].detach().clone()  # [12, 3, 4]
+                intrins = inputs[('K', 0)][:,:3,:3]  # [12, 3, 3]
+                doj_mask = inputs["doj_mask"]  # [12, 1, 192, 512]
                 tgt_imgs[doj_mask.repeat(1,3,1,1)==0] = 0
                 img_w_m1, _, _ = forward_warp(tgt_imgs, teacher_depth, m1_pose, intrins, upscale=3, rotation_mode='euler', padding_mode='zeros')
-                doj_maskm1 = inputs["doj_mask-1"].repeat(1,3,1,1)  # [B, 3, 192, 512]
+                doj_maskm1 = inputs["doj_mask-1"].repeat(1,3,1,1)  # [12, 3, 192, 512]
                 if self.opt.no_teacher_warp:
                     inputs['ori_color', -1, 0] = inputs["color", -1, 0].detach().clone()
                 inputs["color", -1, 0][doj_maskm1==1] = 0
@@ -397,9 +415,9 @@ class Trainer:
                     inputs["color", -1, 0][img_w_m1>0] = 0
                 inputs["color", -1, 0] = inputs["color", -1, 0].detach().clone()
 
-                non_cv_aug = [augmentation_mask[:,0,0,0]==0][0]  # [B]
+                non_cv_aug = [augmentation_mask[:,0,0,0]==0][0]  # [12]
                 if non_cv_aug.sum() > 0:
-                    tgt_imgs_aug = inputs["color_aug", 0, 0].detach().clone()  # [B, 3, 192, 512]
+                    tgt_imgs_aug = inputs["color_aug", 0, 0].detach().clone()  # [12, 3, 192, 512]
                     tgt_imgs_aug[doj_mask.repeat(1,3,1,1)==0] = 0
                     imgaug_w_m1, _, _ = forward_warp(tgt_imgs_aug[non_cv_aug], teacher_depth[non_cv_aug], m1_pose[non_cv_aug], intrins[non_cv_aug], upscale=3, rotation_mode='euler', padding_mode='zeros')
                     warp_frame = lookup_frames[non_cv_aug][:,0,:,:,:].detach().clone()
@@ -408,9 +426,9 @@ class Trainer:
                     lookup_frames[non_cv_aug] = warp_frame.unsqueeze(1).detach().clone()
 
                 if is_train:
-                    p1_pose = outputs[("cam_T_cam", 0, 1)][:, :3, :].detach().clone()  # [B, 3, 4]
+                    p1_pose = outputs[("cam_T_cam", 0, 1)][:, :3, :].detach().clone()  # [12, 3, 4]
                     img_w_p1, _, _ = forward_warp(tgt_imgs, teacher_depth, p1_pose, intrins, upscale=3, rotation_mode='euler', padding_mode='zeros')
-                    doj_maskp1 = inputs["doj_mask+1"].repeat(1,3,1,1)  # [B, 3, 192, 512]
+                    doj_maskp1 = inputs["doj_mask+1"].repeat(1,3,1,1)  # [12, 3, 192, 512]
                     if self.opt.no_teacher_warp:
                         inputs['ori_color', 1, 0] = inputs["color", -1, 0].detach().clone()
                     inputs["color", 1, 0][doj_maskp1==1] = 0
@@ -419,43 +437,17 @@ class Trainer:
                     else:
                         inputs["color", 1, 0][img_w_p1>0] = 0
                     inputs["color", 1, 0] = inputs["color", 1, 0].detach().clone()
-                
+                #pdb.set_trace()
+                #print('warp')
         ####################################################################################################
-
-        _, depth = disp_to_depth(mono_outputs[("disp", 0)], self.opt.min_depth, self.opt.max_depth)
-        for f_i in self.opt.frame_ids[1:]:
-            if f_i < 0:
-                pose = torch.inverse(pose_pred['cam_T_cam', 0, f_i])
-                rigid_flow, _ = tool.depth2flow1(depth, pose[:, :3, :], inputs[("K", 0)][:, :3, :3])
-                warped_tgt_image = flow_warp(inputs["color_aug", 0, 0], rigid_flow)
-                rigid_error = image_similarity(inputs["color_aug", -1, 0], warped_tgt_image)
-
-                flownet_input = torch.cat((inputs["color_aug", 0, 0],
-                                           inputs["color_aug", -1, 0],
-                                           warped_tgt_image,
-                                           rigid_flow,
-                                           L2_norm(rigid_error, dim=1)), dim=1)
-
-            else:
-                pose = torch.inverse(pose_pred['cam_T_cam', 0, f_i])
-                rigid_flow, _ = tool.depth2flow1(depth, pose[:, :3, :], inputs[("K", 0)][:, :3, :3])
-                warped_tgt_image = flow_warp(inputs["color_aug", 0, 0], rigid_flow)
-                rigid_error = image_similarity(inputs["color_aug", 1, 0], warped_tgt_image)
-
-                flownet_input = torch.cat((inputs["color_aug", 0, 0],
-                                           inputs["color_aug", 1, 0],
-                                           warped_tgt_image,
-                                           rigid_flow,
-                                           L2_norm(rigid_error, dim=1)), dim=1)
-
-            self.resflow = self.models["flow"](flownet_input)
-
-            for i in range(4):
-                outputs[("resflow", i, f_i)] = self.resflow[i]
-                mono_outputs[("resflow", i, f_i)] = self.resflow[i]
-
-        self.generate_images_pred(inputs, mono_outputs)
-        mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
+        
+        # print("eee")
+        if is_train:
+            self.generate_images_pred(inputs, mono_outputs)
+            # raise RuntimeError(output.keys())
+            mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
+        else:
+            _, mono_outputs["depth", 0, 0] = disp_to_depth(mono_outputs["disp", 0], self.opt.min_depth, self.opt.max_depth)
 
         # update multi frame outputs dictionary with single frame outputs
         for key in list(mono_outputs.keys()):
@@ -466,29 +458,40 @@ class Trainer:
                 outputs[_key] = mono_outputs[key]
 
         # multi frame path
-        K = [inputs[('K', 0)], inputs[('K', 1)], inputs[('K', 2)], inputs[('K', 3)]]
-        inv_K = [inputs[('inv_K', 0)], inputs[('inv_K', 1)], inputs[('inv_K', 2)], inputs[('inv_K', 3)]]
+        #lookup_frames = lookup_frames.permute([0,1,3,4,2])
+        #lookup_frames[lookup_frames.sum(4) < 0.18]=0
+        #lookup_frames = lookup_frames.permute([0,1,4,2,3])
 
-        if self.opt.dataset == "kitti":
-            flow = F.interpolate(outputs[("resflow", 0, -1)], [48, 160], mode="bilinear", align_corners=True)
-        elif self.opt.dataset == "cityscapes_preprocessed":
-            flow = F.interpolate(outputs[("resflow", 0, -1)], [48, 128], mode="bilinear", align_corners=True)
-        else:
-            raise NotImplementedError
-
-        features, lowest_cost, confidence_mask = self.models["encoder"](
-            inputs["color_aug", 0, 0],
-            lookup_frames,
-            relative_poses,
-            K[2],
-            inv_K[2],
-            flow,
-            min_depth_bin=min_depth_bin,
-            max_depth_bin=max_depth_bin)
-
-        outputs["feat"] = features[-4]
+        features, lowest_cost, confidence_mask = self.models["encoder"](inputs["color_aug", 0, 0],
+                                                                        lookup_frames,
+                                                                        relative_poses,
+                                                                        inputs[('K', 2)],
+                                                                        inputs[('inv_K', 2)],
+                                                                        min_depth_bin=min_depth_bin,
+                                                                        max_depth_bin=max_depth_bin,
+                                                                        teacher_depth=outputs["mono_depth", 0, 0],
+                                                                        doj_mask=inputs["doj_mask"],
+                                                                        cv_min=self.opt.cv_min=='true',
+                                                                        aug_mask=augmentation_mask,
+                                                                        set_1=self.opt.cv_set_1,
+                                                                        pool=self.opt.cv_pool,
+                                                                        pool_r=self.opt.cv_pool_radius,
+                                                                        pool_th=self.opt.cv_pool_th)
         outputs.update(self.models["depth"](features))
 
+        ############# warpping image based on multi frame model pose and depth ###############
+        if self.opt.export:
+            with torch.no_grad():
+                _, multi_depth = disp_to_depth(outputs["disp", 0].detach(), self.opt.min_depth, self.opt.max_depth)  # [12, 1, 192, 512]
+                multi_depth =multi_depth.detach()
+
+                if not is_train:
+                    save_path = 'visualization/pred/{}.npy'.format(int(inputs['index']))
+                    np.save(save_path, multi_depth.squeeze().cpu().numpy())
+           
+        ####################################################################################################
+
+        outputs["feat"] = features[-4]
         outputs["lowest_cost"] = F.interpolate(lowest_cost.unsqueeze(1),
                                                [self.opt.height, self.opt.width],
                                                mode="nearest")[:, 0]
@@ -496,21 +499,31 @@ class Trainer:
                                                     [self.opt.height, self.opt.width],
                                                     mode="nearest")[:, 0]
 
-        if not self.opt.disable_motion_masking:
-            outputs["consistency_mask"] = (outputs["consistency_mask"] *
-                                           self.compute_matching_mask(outputs))
+        if is_train and not self.opt.export:
+            if not self.opt.disable_motion_masking:
+                outputs["consistency_mask"] = (outputs["consistency_mask"] *
+                                            self.compute_matching_mask(outputs))
 
-        self.generate_images_pred(inputs, outputs, is_multi=True)
-        losses = self.compute_losses(inputs, outputs, is_multi=True)
+            self.generate_images_pred(inputs, outputs, is_multi=True)
+            losses = self.compute_losses(inputs, outputs, is_multi=True)
 
-        # update losses with single frame losses
-        if self.train_teacher_and_pose:
-            for key, val in mono_losses.items():
-                losses[key] += val
+            # update losses with single frame losses
+            #print('mono reproj loss: ', mono_losses['reproj_loss/0'])
+            #print('multi reproj loss: ', losses['reproj_loss/0'])
+            #print('multi consis loss: ', losses['consistency_loss/0'])
+            #print('')
+            if self.train_teacher_and_pose:
+                for key, val in mono_losses.items():
+                    if not self.opt.no_multi_loss:
+                        losses[key] += val
+                    else:
+                        losses[key] = val
 
-        # update adaptive depth bins
-        if self.train_teacher_and_pose:
-            self.update_adaptive_depth_bins(outputs)
+            # update adaptive depth bins
+            if self.train_teacher_and_pose:
+                self.update_adaptive_depth_bins(outputs)
+        else:
+            losses = {}
 
         return outputs, losses
 
@@ -530,23 +543,33 @@ class Trainer:
         self.max_depth_tracker = self.max_depth_tracker * 0.99 + max_depth * 0.01
         self.min_depth_tracker = self.min_depth_tracker * 0.99 + min_depth * 0.01
 
-    def predict_poses(self, inputs, features=None):
+    def predict_poses(self, inputs, features=None, is_train=True):
         """Predict poses between input frames for monocular sequences.
         """
         outputs = {}
+        if is_train:
+            frameIDs = self.opt.frame_ids
+        else:
+            frameIDs = [0, -1]
+        # print(frameIDs)
         if self.num_pose_frames == 2:
             # In this setting, we compute the pose to each source frame via a
             # separate forward pass through the pose network.
 
             # predict poses for reprojection loss
             # select what features the pose network takes as input
-            pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
-            for f_i in self.opt.frame_ids[1:]:
+            pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in frameIDs}
+            # print(frameIDs[1:])    -1, 1
+            for f_i in frameIDs[1:]:
                 if f_i != "s":
                     # To maintain ordering we always pass frames in temporal order
                     if f_i < 0:
+                        #mask = ((inputs['doj_mask']+inputs['doj_mask-1'])==0).float()
+                        #pose_inputs = [pose_feats[f_i]*mask, pose_feats[0]*mask]
                         pose_inputs = [pose_feats[f_i], pose_feats[0]]
                     else:
+                        #mask = ((inputs['doj_mask']+inputs['doj_mask+1'])==0).float()
+                        #pose_inputs = [pose_feats[0]*mask, pose_feats[f_i]*mask]
                         pose_inputs = [pose_feats[0], pose_feats[f_i]]
 
                     pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
@@ -559,12 +582,40 @@ class Trainer:
                     outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
                         axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
 
+                    # print(outputs[("axisangle", 0, f_i)].shape)
+                    # print(outputs[("translation", 0, f_i)].shape)
+                    # raise RuntimeError(outputs[("cam_T_cam", 0, f_i)].shape)
+                    #here add inverse 
+                    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                    if f_i < 0:
+                        pose_inputs_1 = [pose_feats[0], pose_feats[f_i]]
+                    else:
+                        pose_inputs_1 = [pose_feats[f_i], pose_feats[0]] 
+
+                    pose_inputs_1 = [self.models["pose_encoder"](torch.cat(pose_inputs_1, 1))]
+
+                    axisangle_1, translation_1 = self.models["pose"](pose_inputs_1)
+                    outputs[("axisangle_1", 0, f_i)] = axisangle_1
+                    outputs[("translation_1", 0, f_i)] = translation_1
+
+                    # Invert the matrix if the frame id is negative
+                    outputs[("cam_T_cam_1", 0, f_i)] = transformation_from_parameters(
+                        axisangle_1[:, 0], translation_1[:, 0], invert=(f_i < 0))
+                    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+                
+                    # raise RuntimeError(outputs[("cam_T_cam", 0, f_i)])
+
             # now we need poses for matching - compute without gradients
             pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.matching_ids}
             with torch.no_grad():
                 # compute pose from 0->-1, -1->-2, -2->-3 etc and multiply to find 0->-3
                 for fi in self.matching_ids[1:]:
                     if fi < 0:
+                        #mask = ((inputs['doj_mask']+inputs['doj_mask-1'])==0).float()
+                        #pose_inputs = [pose_feats[fi]*mask, pose_feats[fi + 1]*mask]
                         pose_inputs = [pose_feats[fi], pose_feats[fi + 1]]
                         pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
                         axisangle, translation = self.models["pose"](pose_inputs)
@@ -576,6 +627,8 @@ class Trainer:
                             pose = torch.matmul(pose, inputs[('relative_pose', fi + 1)])
 
                     else:
+                        #mask = ((inputs['doj_mask']+inputs['doj_mask+1'])==0).float()
+                        #pose_inputs = [pose_feats[fi - 1]*mask, pose_feats[fi]*mask]
                         pose_inputs = [pose_feats[fi - 1], pose_feats[fi]]
                         pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
                         axisangle, translation = self.models["pose"](pose_inputs)
@@ -594,8 +647,9 @@ class Trainer:
                     inputs[('relative_pose', fi)] = pose
         else:
             raise NotImplementedError
-
-        return outputs
+        # raise RuntimeError(outputs.keys())
+        # raise RuntimeError(outputs.keys())  dict_keys([('axisangle', 0, -1), ('translation', 0, -1), ('cam_T_cam', 0, -1), ('axisangle', 0, 1), ('translation', 0, 1), ('cam_T_cam', 0, 1)])
+        return outputs  
 
     def val(self):
         """Validate the model on a single minibatch
@@ -629,6 +683,7 @@ class Trainer:
             self.best = losses["de/abs_rel"]
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!saving best result: ", self.best)
             for l, v in losses.items():
+                wandb.log({"best{}".format(l): v}, step=self.step)
                 writer = self.writers['val']
                 writer.add_scalar("best{}".format(l), v, self.step)
                 print(l, v)
@@ -638,6 +693,7 @@ class Trainer:
                 self.save_model('absrel{}'.format(absrel))
         if losses["doj/de/abs_rel"] < self.doj_best:
             self.doj_best = losses["doj/de/abs_rel"]
+            wandb.log({"bestdoj/de/absrel": self.doj_best}, step=self.step)
             print("***********************************dynamic objects depth best result: ", self.doj_best)
             print('doj pxs', losses['dojpxs'])
             print('all pxs', losses['allpxs'])
@@ -654,21 +710,19 @@ class Trainer:
         """
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
-
+            # raise RuntimeError(self.opt.v1_multiscale)   False
             if self.opt.v1_multiscale:
                 source_scale = scale
             else:
-                disp = F.interpolate(disp,
-                                     [self.opt.height, self.opt.width], mode="bilinear", align_corners=True)
+                disp = F.interpolate(
+                    disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
                 source_scale = 0
 
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
             outputs[("depth", 0, scale)] = depth
 
-            for frame_id in self.opt.frame_ids[1:]:
-                resflow = outputs[("resflow"), scale, frame_id]
-                resflow = F.interpolate(resflow,
-                                        [self.opt.height, self.opt.width], mode="bilinear", align_corners=True)
+            for i, frame_id in enumerate(self.opt.frame_ids[1:]):
+
                 T = outputs[("cam_T_cam", 0, frame_id)]
                 if is_multi:
                     # don't update posenet based on multi frame prediction
@@ -676,59 +730,72 @@ class Trainer:
 
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
+                # print(cam_points.shape)
+
+                #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                # print(frame_id)
+         
+                if(frame_id == -1):
+                    flownet_input = torch.cat((inputs["color_aug", 0, 0],
+                                            inputs["color_aug", -1, 0]),dim=1)
+                    resflow,t2,t3,t4 = self.models["flow"](flownet_input)
+                else:
+                    flownet_input = torch.cat((inputs["color_aug", 0, 0],
+                                            inputs["color_aug", 1, 0]),dim=1)
+                    resflow,_,_,_ = self.models["flow"](flownet_input)
+
+                
+                # print(cam_points.shape)
+                # raise RuntimeError(resflow.shape)
+                cam_points[:,:3,:] = cam_points[:,:3,:] + resflow.view(self.opt.batch_size, 3 , -1) * 0.1
+                #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                # raise RuntimeError(inputs.keys())
+                
+
+
                 pix_coords = self.project_3d[source_scale](
                     cam_points, inputs[("K", source_scale)], T)
+                # raise RuntimeError(pix_coords.shape)
 
                 outputs[("sample", frame_id, scale)] = pix_coords
 
-                outputs[("color", frame_id, scale)] = F.grid_sample(
-                    inputs[("color", frame_id, source_scale)],
-                    outputs[("sample", frame_id, scale)],
-                    padding_mode="border", align_corners=True)
-
-                if is_multi:
-                    pix_coords = pix_coords + resflow.permute(0, 2, 3, 1)
-
-                    outputs[("sample", frame_id, scale)] = pix_coords
-
-                    outputs[("color_flow", frame_id, scale)] = F.grid_sample(
+                if (not is_multi) and self.opt.no_teacher_warp and (not self.opt.train_teacher_only):
+                    outputs[("color", frame_id, scale)] = F.grid_sample(
+                        inputs[("ori_color", frame_id, source_scale)],
+                        outputs[("sample", frame_id, scale)],
+                        padding_mode="border", align_corners=True)
+                else:
+                    outputs[("color", frame_id, scale)] = F.grid_sample(
                         inputs[("color", frame_id, source_scale)],
                         outputs[("sample", frame_id, scale)],
                         padding_mode="border", align_corners=True)
+                #pdb.set_trace()
 
-                outputs[("rigid_flow", frame_id, scale)], \
-                outputs[("mask", frame_id, scale)] = tool.depth2flow1(depth, T[:, :3, :],
-                                                                      inputs[("K", source_scale)][:, :3, :3])
+                if not self.opt.disable_automasking:
+                    if (not is_multi) and self.opt.no_teacher_warp and (not self.opt.train_teacher_only):
+                        outputs[("color_identity", frame_id, scale)] = \
+                            inputs[("ori_color", frame_id, source_scale)]
+                    else:
+                        outputs[("color_identity", frame_id, scale)] = \
+                            inputs[("color", frame_id, source_scale)]
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
         """
+        if self.opt.zero_img:
+            mask = (pred.sum(1) < 0.1).unsqueeze(1).repeat([1,3,1,1]).detach()
+            pred = pred.clone()
+            pred[mask] = 0
+            target[mask] = 0
         abs_diff = torch.abs(target - pred)
         l1_loss = abs_diff.mean(1, True)
 
-        if self.opt.no_ssim:
+        if self.opt.no_ssim == 'true':
             reprojection_loss = l1_loss
         else:
             ssim_loss = self.ssim(pred, target).mean(1, True)
             reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
-        return reprojection_loss
-
-    def compute_reprojection_loss1(self, pred, pred1, target):
-        """Computes reprojection loss between a batch of predicted and target images
-        """
-        abs_diff0 = torch.abs(target - pred)
-        abs_diff1 = torch.abs(target - pred1)
-        abs_diff = torch.where(abs_diff0 < abs_diff1, abs_diff0, abs_diff1)
-        l1_loss = abs_diff.mean(1, True)
-
-        if self.opt.no_ssim:
-            reprojection_loss = l1_loss
-        else:
-            ssim_loss0 = self.ssim(pred, target).mean(1, True)
-            ssim_loss1 = self.ssim(pred1, target).mean(1, True)
-            ssim_loss = (ssim_loss0 + ssim_loss1) * 0.5
-            reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
         return reprojection_loss
 
     @staticmethod
@@ -756,16 +823,44 @@ class Trainer:
         matching_depth = 1 / outputs['lowest_cost'].unsqueeze(1).to(self.device)
 
         # mask where they differ by a large amount
-        mask = ((matching_depth - mono_output) / mono_output).abs() < 1.0
-        mask *= ((mono_output - matching_depth) / matching_depth).abs() < 1.0
+        mask = ((matching_depth - mono_output) / mono_output) < 1.0
+        mask *= ((mono_output - matching_depth) / matching_depth) < 1.0
         return mask[:, 0]
 
     def compute_losses(self, inputs, outputs, is_multi=False):
         """Compute the reprojection, smoothness and proxy supervised losses for a minibatch
         """
-        robust = True
+        # raise RuntimeError(inputs.keys())
         losses = {}
         total_loss = 0
+        # raise RuntimeError(outputs.keys())
+        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        tran_mat_1_2 = outputs[('cam_T_cam', 0, 1)]
+        tran_mat_1_0 = outputs[('cam_T_cam', 0, -1)]
+        tran_mat_2_1 = outputs[('cam_T_cam_1', 0, 1)]
+        tran_mat_0_1 = outputs[('cam_T_cam_1', 0, -1)]
+        # raise RuntimeError(tran_mat_1_2.shape)
+
+        mat_I = torch.eye(4)
+        mat_I = mat_I.unsqueeze(0)
+        mat_I = mat_I.expand(self.opt.batch_size,-1,-1).cuda()
+        tran_mat_1_2_1 = torch.bmm(tran_mat_1_2, tran_mat_2_1) - mat_I
+        tran_mat_1_0_1 = torch.bmm(tran_mat_1_0, tran_mat_0_1) - mat_I
+        tran_mat_1_0_1 = torch.sum(torch.abs(tran_mat_1_0_1))
+        tran_mat_1_2_1 = torch.sum(torch.abs(tran_mat_1_2_1))
+
+        motion_consistency_loss = (tran_mat_1_0_1 + tran_mat_1_2_1) * 0.1
+        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        # raise RuntimeError(tran_mat_1_0_1[0])
+
+
+
+        # raise RuntimeError(tran_mat_1_0_1[0])
+        # print(outputs[('depth', 0, 0)].shape)
+        # print(outputs[('depth', 0, 1)].shape)
+        # print(outputs[('depth', 0, 2)].shape)
+        # print(outputs[('depth', 0, 3)].shape)
+        # raise RuntimeError("?")
 
         for scale in self.opt.scales:
             loss = 0
@@ -777,35 +872,25 @@ class Trainer:
                 source_scale = 0
 
             disp = outputs[("disp", scale)]
+            
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
 
-            # if robust:
-            #     if source_scale != scale:
-            #         disp_source = outputs[("disp", source_scale)]
-            #         _, _, h, w = disp_source.shape
-            #         disp_tmp = F.interpolate(disp, [h, w], mode="bilinear", align_corners=True)
-            #         disp_loss_diff = (torch.abs(disp_source - disp_tmp) + 0.01).pow(0.4)
-            #         loss += 0.001 * disp_loss_diff.mean()
-            #
-            #         losses['disp_loss_diff/{}'.format(scale)] = 0.001 * disp_loss_diff.mean()
-
             for frame_id in self.opt.frame_ids[1:]:
-                if is_multi:
-                    pred = outputs[("color_flow", frame_id, scale)]
-                    pred1 = outputs[("color", frame_id, scale)]
-                    reprojection_losses.append(self.compute_reprojection_loss1(pred, pred1, target))
-                else:
-                    pred = outputs[("color", frame_id, scale)]
-                    reprojection_losses.append(self.compute_reprojection_loss(pred, target))
+                pred = outputs[("color", frame_id, scale)]
+                reprojection_losses.append(self.compute_reprojection_loss(pred, target))
             reprojection_losses = torch.cat(reprojection_losses, 1)
 
-            if not self.opt.disable_automasking:
+            if not self.opt.disable_automasking: # for stationary objects or static camera or low texture area
                 identity_reprojection_losses = []
                 for frame_id in self.opt.frame_ids[1:]:
-                    pred = inputs[("color", frame_id, source_scale)]
+                    if (not is_multi) and self.opt.no_teacher_warp and (not self.opt.train_teacher_only):
+                        pred = inputs[("ori_color", frame_id, source_scale)]
+                    else:
+                        pred = inputs[("color", frame_id, source_scale)]
                     identity_reprojection_losses.append(
                         self.compute_reprojection_loss(pred, target))
+
                 identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
 
                 if self.opt.avg_reprojection:
@@ -822,6 +907,25 @@ class Trainer:
             else:
                 # differently to Monodepth2, compute mins as we go
                 reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
+            # raise RuntimeError(reprojection_loss.shape)  ([8, 1, 192, 512])
+
+            # print(self.opt.selec_reproj)  T
+            # print(self.opt.disable_automasking)  F
+            # raise RuntimeError("?")
+
+
+
+            if self.opt.selec_reproj:
+                maskm1 = (outputs[("color", -1, scale)].sum(1) < 0.1).detach()
+                maskp1 = (outputs[("color", 1, scale)].sum(1) < 0.1).detach()
+                maskor = ((maskm1 + maskp1) > 0).detach()
+                # maskand = (maskm1 * maskp1).detach()
+                # print(maskm1.shape)
+                reprojection_loss[maskm1.unsqueeze(1)] = (reprojection_losses[:,1,:,:])[maskm1]
+                reprojection_loss[maskp1.unsqueeze(1)] = (reprojection_losses[:,0,:,:])[maskp1]
+                # reprojection_loss[maskand.unsqueeze(1)] = 0
+                reprojection_loss[maskor.unsqueeze(1)] = 0
+
 
             if not self.opt.disable_automasking:
                 # add random numbers to break ties
@@ -839,29 +943,40 @@ class Trainer:
                 if not self.opt.disable_motion_masking:
                     reprojection_loss_mask = (reprojection_loss_mask *
                                               outputs['consistency_mask'].unsqueeze(1))
-                if not self.opt.no_matching_augmentation:
+                if not self.opt.no_matching_augmentation == 'true':
                     reprojection_loss_mask = (reprojection_loss_mask *
                                               (1 - outputs['augmentation_mask']))
                 consistency_mask = (1 - reprojection_loss_mask).float()
 
-            if is_multi:
-                maskm1 = (outputs[("color_flow", -1, scale)].sum(1) < 0.1).detach()
-                maskp1 = (outputs[("color_flow", 1, scale)].sum(1) < 0.1).detach()
-            else:
-                maskm1 = (outputs[("color", -1, scale)].sum(1) < 0.1).detach()
-                maskp1 = (outputs[("color", 1, scale)].sum(1) < 0.1).detach()
-
-            maskand = (maskm1 * maskp1).detach()
-            reprojection_loss[maskm1.unsqueeze(1)] = (reprojection_losses[:, 1, :, :])[maskm1]
-            reprojection_loss[maskp1.unsqueeze(1)] = (reprojection_losses[:, 0, :, :])[maskp1]
-            reprojection_loss[maskand.unsqueeze(1)] = 0
-
             # standard reprojection loss
             reprojection_loss = reprojection_loss * reprojection_loss_mask
-            reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
+            # print(reprojection_loss.shape)  ([8, 1, 192, 512])
 
+            #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            reprojection_loss = reprojection_loss.sum(3).sum(2).sum(1)
+            # print(reprojection_loss.shape)     8
+            # raise RuntimeError(inputs.keys())
+            doj_mask_1 = inputs['doj_mask']
+            doj_mask_1_prev = inputs['doj_mask-1']
+            doj_mask_1_next = inputs['doj_mask+1']
+            mask_count = (doj_mask_1 * doj_mask_1_prev * doj_mask_1_next).sum(3).sum(2).sum(1)
+            # raise RuntimeError(mask_count)
+            mask_weights = torch.ones(self.opt.batch_size).cuda() - mask_count / (192 * 512)
+            mask_weights = mask_weights ** 0.5
+            # mask_weights = mask_count / (192 * 512)
+            # print(mask_count)
+            # raise RuntimeError(mask_weights)
+            # raise RuntimeError(mask_weights)
+            reprojection_loss = reprojection_loss * mask_weights
+            #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+            # print(doj_mask_1.shape)
+
+            reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
+            # print(reprojection_loss.shape)
             # consistency loss:
             # encourage multi frame prediction to be like singe frame where masking is happening
+            # raise RuntimeError(is_multi)  False
             if is_multi:
                 multi_depth = outputs[("depth", 0, scale)]
                 # no gradients for mono prediction!
@@ -878,208 +993,78 @@ class Trainer:
             else:
                 consistency_loss = 0
 
+            # raise RuntimeError(outputs.keys())
+
+
             losses['reproj_loss/{}'.format(scale)] = reprojection_loss
+            # raise RuntimeError(reprojection_loss)
             loss += reprojection_loss + consistency_loss
 
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)
 
-            if is_multi:
-                smooth_flow_loss = 0
-                for frame_id in self.opt.frame_ids[1:]:
-                    smooth_flow_loss = flow_smooth_loss(outputs[("resflow", scale, frame_id)])
-                losses['smooth_flow_loss/{}'.format(scale)] = smooth_flow_loss
-                loss += 0.0001 * (0.5 ** scale) * smooth_flow_loss
-
-            loss += self.opt.disparity_smoothness * (0.5 ** scale) * smooth_loss
+            loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
 
         total_loss /= self.num_scales
+        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        scale_consistency_loss = 0
+        depth0 = outputs[('depth', 0, 0)]
+        depth1 = outputs[('depth', 0, 1)]
+        depth2 = outputs[('depth', 0, 2)]
+        depth3 = outputs[('depth', 0, 3)]
 
-        losses["loss"] = total_loss
+        abs_diff = torch.abs(depth0 - depth1) + torch.abs(depth1 - depth2) + torch.abs(depth2 - depth3)
+        scale_consistency_loss = abs_diff.mean()
+        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        # raise RuntimeError(scale_consistency_loss.shape)
+
+        if self.opt.feat_loss=='true' and is_multi:
+            losses["loss/feat_loss"] = self.get_feature_metric_loss(outputs["feat"], inputs[("color", 0, 0)])
+            total_loss += losses["loss/feat_loss"]
+
+        #add pose consistency loss
+        # raise RuntimeError(outputs.keys())  [('axisangle', 0, -1), ('translation', 0, -1), ('cam_T_cam', 0, -1), ('axisangle_1', 0, -1), ('translation_1', 0, -1), ('cam_T_cam_1', 0, -1), ('axisangle', 0, 1), ('translation', 0, 1), ('cam_T_cam', 0, 1), ('axisangle_1', 0, 1), ('translation_1', 0, 1), ('cam_T_cam_1', 0, 1)
+
+        # transition_0_1 = torch.matmul()    torch.eye(4)
+
+
+        # losses["loss"] = total_loss + motion_consistency_loss
+        # losses["loss"] = total_loss + scale_consistency_loss
+        losses["loss"] = total_loss + motion_consistency_loss + scale_consistency_loss
 
         return losses
 
-    def log_loss(self, mode, losses):
-        writer = self.writers[mode]
-        for l, v in losses.items():
-            writer.add_scalar("{}".format(l), v, self.step)
+    def gradient(self, D):
+        D_dy = D[:, :, 1:] - D[:, :, :-1]
+        D_dx = D[:, :, :, 1:] - D[:, :, :, :-1]
+        return D_dx, D_dy
 
-    def log(self, mode, inputs, outputs, losses):
-        """Write an event to the tensorboard events file
-        """
-        writer = self.writers[mode]
-        for l, v in losses.items():
-            writer.add_scalar("{}".format(l), v, self.step)
+    def get_feature_metric_loss(self, feature, img):
+        b, _, h, w = feature.size()
+        img = F.interpolate(img, (h, w), mode='area')
 
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
-            s = 0  # log only max scale
-            for frame_id in self.opt.frame_ids:
-                writer.add_image(
-                    "color_{}_{}/{}".format(frame_id, s, j),
-                    inputs[("color", frame_id, s)][j].data, self.step)
-                if s == 0 and frame_id != 0:
-                    writer.add_image(
-                        "color_pred_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("color", frame_id, s)][j].data, self.step)
-                    writer.add_image(
-                        "color_pred_flow_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("color_flow", frame_id, s)][j].data, self.step)
+        feature_dx, feature_dy = self.gradient(feature)
+        img_dx, img_dy = self.gradient(img)
 
-                    flow_color = flow_vis.flow_to_color(
-                        outputs[('resflow', 0, frame_id)][j].permute(1, 2, 0).cpu().detach().numpy(),
-                        convert_to_bgr=False)
+        feature_dxx, feature_dxy = self.gradient(feature_dx)
+        feature_dyx, feature_dyy = self.gradient(feature_dy)
 
-                    rigid_flow_color = flow_vis.flow_to_color(
-                        outputs[("rigid_flow", frame_id, 0)][j].permute(1, 2, 0).cpu().detach().numpy(),
-                        convert_to_bgr=False)
-                    writer.add_image(
-                        "flow_{}_{}/{}".format(frame_id, s, j),
-                        flow_color.transpose(2, 0, 1), self.step)
+        img_dxx, img_dxy = self.gradient(img_dx)
+        img_dyx, img_dyy = self.gradient(img_dy)
 
-                    writer.add_image(
-                        "rigid_flow_{}_{}/{}".format(frame_id, s, j),
-                        rigid_flow_color.transpose(2, 0, 1), self.step)
-                    full_color = flow_vis.flow_to_color(
-                        (outputs[("rigid_flow", frame_id, 0)][j] +
-                         outputs[('resflow', 0, frame_id)][j]).permute(1, 2, 0).cpu().detach().numpy(),
-                        convert_to_bgr=False)
-                    writer.add_image(
-                        "full_flow_{}_{}/{}".format(frame_id, s, j),
-                        full_color.transpose(2, 0, 1), self.step)
+        smooth1 = torch.mean(feature_dx.abs() * torch.exp(-img_dx.abs().mean(1, True))) + \
+                  torch.mean(feature_dy.abs() * torch.exp(-img_dy.abs().mean(1, True)))
 
-            disp = colormap(outputs[("disp", s)][j, 0])
-            writer.add_image(
-                "disp_multi_{}/{}".format(s, j),
-                disp, self.step)
+        smooth2 = torch.mean(feature_dxx.abs() * torch.exp(-img_dxx.abs().mean(1, True))) + \
+                  torch.mean(feature_dxy.abs() * torch.exp(-img_dxy.abs().mean(1, True))) + \
+                  torch.mean(feature_dyx.abs() * torch.exp(-img_dyx.abs().mean(1, True))) + \
+                  torch.mean(feature_dyy.abs() * torch.exp(-img_dyy.abs().mean(1, True)))
 
-            disp = colormap(outputs[('mono_disp', s)][j, 0])
-            writer.add_image(
-                "disp_mono/{}".format(j),
-                disp, self.step)
+        return -self.opt.feat_dis * smooth1+ self.opt.feat_cvt * smooth2
 
-            if outputs.get("lowest_cost") is not None:
-                lowest_cost = outputs["lowest_cost"][j]
-
-                consistency_mask = \
-                    outputs['consistency_mask'][j].cpu().detach().unsqueeze(0).numpy()
-
-                min_val = np.percentile(lowest_cost.numpy(), 10)
-                max_val = np.percentile(lowest_cost.numpy(), 90)
-                lowest_cost = torch.clamp(lowest_cost, min_val, max_val)
-                lowest_cost = colormap(lowest_cost)
-
-                writer.add_image(
-                    "lowest_cost/{}".format(j),
-                    lowest_cost, self.step)
-                writer.add_image(
-                    "lowest_cost_masked/{}".format(j),
-                    lowest_cost * consistency_mask, self.step)
-                writer.add_image(
-                    "consistency_mask/{}".format(j),
-                    consistency_mask, self.step)
-
-                consistency_target = colormap(outputs["consistency_target/0"][j])
-                writer.add_image(
-                    "consistency_target/{}".format(j),
-                    consistency_target, self.step)
-
-    def save_opts(self):
-        """Save options to disk so we know what we ran this experiment with
-        """
-        models_dir = os.path.join(self.log_path, "models")
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir)
-        to_save = self.opt.__dict__.copy()
-
-        with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
-            json.dump(to_save, f, indent=2)
-
-    def save_model(self, save_step=False):
-        """Save model weights to disk
-        """
-        if save_step:
-            save_folder = os.path.join(self.log_path, "models", "weights_{}_{}".format(self.epoch,
-                                                                                       self.step))
-        else:
-            save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
-
-        if not os.path.exists(save_folder):
-            os.makedirs(save_folder)
-
-        for model_name, model in self.models.items():
-            save_path = os.path.join(save_folder, "{}.pth".format(model_name))
-            to_save = model.state_dict()
-            if model_name == 'encoder':
-                # save the sizes - these are needed at prediction time
-                to_save['height'] = self.opt.height
-                to_save['width'] = self.opt.width
-                # save estimates of depth bins
-                to_save['min_depth_bin'] = self.min_depth_tracker
-                to_save['max_depth_bin'] = self.max_depth_tracker
-            torch.save(to_save, save_path)
-
-        save_path = os.path.join(save_folder, "{}.pth".format("adam"))
-        torch.save(self.model_optimizer.state_dict(), save_path)
-
-    def load_mono_model(self):
-
-        model_list = ['pose_encoder', 'pose', 'mono_encoder', 'mono_depth']
-        for n in model_list:
-            print('loading {}'.format(n))
-            path = os.path.join(self.opt.mono_weights_folder, "{}.pth".format(n))
-            model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
-
-            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.models[n].load_state_dict(model_dict)
-
-    def load_model(self):
-        """Load model(s) from disk
-        """
-        self.opt.load_weights_folder = os.path.expanduser(self.opt.load_weights_folder)
-
-        assert os.path.isdir(self.opt.load_weights_folder), \
-            "Cannot find folder {}".format(self.opt.load_weights_folder)
-        print("loading model from folder {}".format(self.opt.load_weights_folder))
-
-        for n in self.opt.models_to_load:
-            print("Loading {} weights...".format(n))
-            path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
-            model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
-
-            if n == 'encoder':
-                min_depth_bin = pretrained_dict.get('min_depth_bin')
-                max_depth_bin = pretrained_dict.get('max_depth_bin')
-                print('min depth', min_depth_bin, 'max_depth', max_depth_bin)
-                if min_depth_bin is not None:
-                    # recompute bins
-                    print('setting depth bins!')
-                    self.models['encoder'].compute_depth_bins(min_depth_bin, max_depth_bin)
-
-                    self.min_depth_tracker = min_depth_bin
-                    self.max_depth_tracker = max_depth_bin
-
-            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.models[n].load_state_dict(model_dict, strict=False)
-
-        # loading adam state
-        optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
-        if os.path.isfile(optimizer_load_path):
-            try:
-                print("Loading Adam weights")
-                optimizer_dict = torch.load(optimizer_load_path)
-                self.model_optimizer.load_state_dict(optimizer_dict)
-            except ValueError:
-                print("Can't load Adam - using random")
-        else:
-            print("Cannot find Adam weights so Adam is randomly initialized")
-        
     def compute_depth_losses(self, inputs, outputs, losses, idx, accumulate=False):
         """Compute depth metrics, to allow monitoring during training
 
@@ -1141,8 +1126,13 @@ class Trainer:
         losses['dojpxs'] += doj_mask.sum()
         losses['allpxs'] += mask.sum()
 
+
+        # raise RuntimeError(doj_mask.shape)
         depth_errors = compute_depth_errors(gt_depth[mask], depth_pred[mask])
         doj_errors = compute_depth_errors(gt_depth[doj_mask], depth_pred[doj_mask])
+
+
+
         if doj_mask.sum() > 0:
             losses['doj/count'] += 1
 
@@ -1153,6 +1143,191 @@ class Trainer:
                     losses['doj/'+metric] += np.array(doj_errors[i].cpu())
             else:
                 losses[metric] = np.array(depth_errors[i].cpu())
+        
+
+    def log_time(self, batch_idx, duration, loss):
+        """Print a logging statement to the terminal
+        """
+        samples_per_sec = self.opt.batch_size / duration
+        time_sofar = time.time() - self.start_time
+        training_time_left = (
+            self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+        print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
+            " | loss: {:.5f} | time elapsed: {} | time left: {}"
+        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
+                                  sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+
+    def log(self, mode, inputs, outputs, losses):
+        """Write an event to the tensorboard events file
+        """
+        if mode == 'val':
+            frameIDs = [0, -1]
+            BS = 1
+        else:
+            frameIDs = self.opt.frame_ids
+            BS = self.opt.batch_size
+
+        writer = self.writers[mode]
+        for l, v in losses.items():
+            wandb.log({"{}_{}".format(mode, l): v}, step=self.step)
+            writer.add_scalar("{}".format(l), v, self.step)
+
+        for j in range(min(4, BS)):  # write a maxmimum of four images
+            s = 0  # log only max scale
+            for frame_id in frameIDs:
+                writer.add_image(
+                    "color_{}_{}/{}".format(frame_id, s, j),
+                    inputs[("color", frame_id, s)][j].data, self.step)
+                logimg = wandb.Image(inputs[("color", frame_id, s)][j].data.permute(1,2,0).cpu().numpy())
+                wandb.log({"{}/color_{}_{}/{}".format(mode, frame_id, s, j): logimg}, step=self.step)
+                if s == 0 and frame_id != 0 and mode == 'train':
+                    writer.add_image(
+                        "color_pred_{}_{}/{}".format(frame_id, s, j),
+                        outputs[("color", frame_id, s)][j].data, self.step)
+                    logimg = wandb.Image(outputs[("color", frame_id, s)][j].data.permute(1,2,0).cpu().numpy())
+                    wandb.log({"{}/color_pred_{}_{}/{}".format(mode, frame_id, s, j): logimg}, step=self.step)
+
+            disp = colormap(outputs[("disp", s)][j, 0])
+            writer.add_image(
+                "disp_multi_{}/{}".format(s, j),
+                disp, self.step)
+            logimg = wandb.Image(disp.transpose(1,2,0))
+            wandb.log({"{}/disp_multi_{}/{}".format(mode, s, j): logimg}, step=self.step)
+            disp = colormap(outputs[('mono_disp', s)][j, 0])
+            writer.add_image(
+                "disp_mono/{}".format(j),
+                disp, self.step)
+            logimg = wandb.Image(disp.transpose(1,2,0))
+            wandb.log({"{}/disp_mono/{}".format(mode, j): logimg}, step=self.step)
+
+            if outputs.get("lowest_cost") is not None:
+                lowest_cost = outputs["lowest_cost"][j]
+
+                consistency_mask = \
+                    outputs['consistency_mask'][j].cpu().detach().unsqueeze(0).numpy()
+
+                min_val = np.percentile(lowest_cost.numpy(), 10)
+                max_val = np.percentile(lowest_cost.numpy(), 90)
+                lowest_cost = torch.clamp(lowest_cost, min_val, max_val)
+                lowest_cost = colormap(lowest_cost)
+
+                writer.add_image(
+                    "lowest_cost/{}".format(j),
+                    lowest_cost, self.step)
+                writer.add_image(
+                    "lowest_cost_masked/{}".format(j),
+                    lowest_cost * consistency_mask, self.step)
+                writer.add_image(
+                    "consistency_mask/{}".format(j),
+                    consistency_mask, self.step)
+                logimg = wandb.Image(lowest_cost.transpose(1,2,0))
+                wandb.log({"{}/lowest_cost/{}".format(mode, j): logimg}, step=self.step)
+                logimg = wandb.Image((lowest_cost * consistency_mask).transpose(1,2,0))
+                wandb.log({"{}/lowest_cost_masked/{}".format(mode, j): logimg}, step=self.step)
+                logimg = wandb.Image(consistency_mask.transpose(1,2,0))
+                wandb.log({"{}/consistency_mask/{}".format(mode, j): logimg}, step=self.step)
+                if mode == 'train':
+                    consistency_target = colormap(outputs["consistency_target/0"][j])
+                    # writer.add_image(
+                    #     "consistency_target/{}".format(j),
+                    #     consistency_target, self.step)
+                    logimg = wandb.Image(consistency_target[0].transpose(1,2,0))
+                    wandb.log({"{}/consistency_target/{}".format(mode, j): logimg}, step=self.step)
+    def save_opts(self):
+        """Save options to disk so we know what we ran this experiment with
+        """
+        models_dir = os.path.join(self.log_path, "models")
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir)
+        to_save = self.opt.__dict__.copy()
+
+        with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
+            json.dump(to_save, f, indent=2)
+
+    def save_model(self, name=None, save_step=False):
+        """Save model weights to disk
+        """
+        if name is not None:
+            save_folder = os.path.join(self.log_path, "models", "weights_{}".format(name))
+        else:
+            if save_step:
+                save_folder = os.path.join(self.log_path, "models", "weights_{}_{}".format(self.epoch,
+                                                                                        self.step))
+            else:
+                save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
+        if not os.path.exists(save_folder):
+            os.makedirs(save_folder)
+
+        for model_name, model in self.models.items():
+            save_path = os.path.join(save_folder, "{}.pth".format(model_name))
+            to_save = model.state_dict()
+            if model_name == 'encoder':
+                # save the sizes - these are needed at prediction time
+                to_save['height'] = self.opt.height
+                to_save['width'] = self.opt.width
+                # save estimates of depth bins
+                to_save['min_depth_bin'] = self.min_depth_tracker
+                to_save['max_depth_bin'] = self.max_depth_tracker
+            torch.save(to_save, save_path)
+
+        save_path = os.path.join(save_folder, "{}.pth".format("adam"))
+        torch.save(self.model_optimizer.state_dict(), save_path)
+
+    def load_mono_model(self):
+
+        model_list = ['pose_encoder', 'pose', 'mono_encoder', 'mono_depth']
+        for n in model_list:
+            print('loading {}'.format(n))
+            path = os.path.join(self.opt.mono_weights_folder, "{}.pth".format(n))
+            model_dict = self.models[n].state_dict()
+            pretrained_dict = torch.load(path)
+
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+            model_dict.update(pretrained_dict)
+            self.models[n].load_state_dict(model_dict)
+
+    def load_model(self):
+        """Load model(s) from disk
+        """
+        self.opt.load_weights_folder = os.path.expanduser(self.opt.load_weights_folder)
+
+        assert os.path.isdir(self.opt.load_weights_folder), \
+            "Cannot find folder {}".format(self.opt.load_weights_folder)
+        print("loading model from folder {}".format(self.opt.load_weights_folder))
+
+        for n in self.opt.models_to_load:
+            print("Loading {} weights...".format(n))
+            path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
+            model_dict = self.models[n].state_dict()
+            pretrained_dict = torch.load(path)
+
+            if n == 'encoder':
+                min_depth_bin = pretrained_dict.get('min_depth_bin')
+                max_depth_bin = pretrained_dict.get('max_depth_bin')
+                print('min depth', min_depth_bin, 'max_depth', max_depth_bin)
+                if min_depth_bin is not None:
+                    # recompute bins
+                    print('setting depth bins!')
+                    self.models['encoder'].compute_depth_bins(min_depth_bin, max_depth_bin)
+
+                    self.min_depth_tracker = min_depth_bin
+                    self.max_depth_tracker = max_depth_bin
+
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+            model_dict.update(pretrained_dict)
+            self.models[n].load_state_dict(model_dict)
+
+        # loading adam state
+        optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
+        if os.path.isfile(optimizer_load_path):
+            try:
+                print("Loading Adam weights")
+                optimizer_dict = torch.load(optimizer_load_path)
+                self.model_optimizer.load_state_dict(optimizer_dict)
+            except ValueError:
+                print("Can't load Adam - using random")
+        else:
+            print("Cannot find Adam weights so Adam is randomly initialized")
 
 
 def colormap(inputs, normalize=True, torch_transpose=True):
