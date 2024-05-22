@@ -1,4 +1,6 @@
-# Codes for CS172 Project
+# Disentangling Object Motion for Self supervised Depth Estimation
+This is our CS172 final project, we made some improvements based on Dynamic Depth
+For brief understanding of our project, you can read our final poster, or our report.
 
 ## Set up the environment
 ```bash
